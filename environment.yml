@@ -11,6 +11,9 @@ dependencies:
   - openmm=7.7
   - pdbfixer
   - pytorch-lightning
+  - cudatoolkit==11.7.*
+  - cuda==11.7.*
+  - cudatoolkit-dev==11.7.*
   - biopython
   - numpy
   - pandas
@@ -35,4 +38,3 @@ dependencies:
       - deepspeed==0.12.4
       - dm-tree==0.1.6
       - git+https://github.com/NVIDIA/dllogger.git
-      - git+https://github.com/Dao-AILab/flash-attention.git@5b838a8
