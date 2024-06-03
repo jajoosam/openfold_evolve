@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+
 import argparse
 import logging
 import math
@@ -184,6 +186,13 @@ def main(args):
         long_sequence_inference=args.long_sequence_inference,
         use_deepspeed_evoformer_attention=args.use_deepspeed_evoformer_attention,
         )
+    
+    # adding dropout masks to config
+    msa_dropout_mask = torch.load('msa_dropout_mask.pt')
+    pair_dropout_mask = torch.load('pair_dropout_mask.pt')
+
+    config.model.evoformer_stack.msa_dropout_mask = msa_dropout_mask
+    config.model.evoformer_stack.pair_dropout_mask = pair_dropout_mask
 
     if args.experiment_config_json: 
         with open(args.experiment_config_json, 'r') as f:

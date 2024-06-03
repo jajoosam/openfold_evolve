@@ -119,11 +119,11 @@ class MSATransition(nn.Module):
 
         return m
 
-
 class PairStack(nn.Module):
     def __init__(
         self,
         c_z: int,
+        pair_dropout_mask: torch.Tensor,
         c_hidden_mul: int,
         c_hidden_pair_att: int,
         no_heads_pair: int,
@@ -173,6 +173,7 @@ class PairStack(nn.Module):
         )
 
         self.ps_dropout_row_layer = DropoutRowwise(pair_dropout)
+        self.pair_dropout_mask = pair_dropout_mask
 
     def forward(self,
         z: torch.Tensor,
@@ -199,7 +200,7 @@ class PairStack(nn.Module):
             _add_with_inplace=True,
         )
         if (not inplace_safe):
-            z = z + self.ps_dropout_row_layer(tmu_update)
+            z = z + self.ps_dropout_row_layer(tmu_update, mask=self.pair_dropout_mask[0])
         else:
             z = tmu_update
 
@@ -212,7 +213,7 @@ class PairStack(nn.Module):
             _add_with_inplace=True,
         )
         if (not inplace_safe):
-            z = z + self.ps_dropout_row_layer(tmu_update)
+            z = z + self.ps_dropout_row_layer(tmu_update, mask=self.pair_dropout_mask[1])
         else:
             z = tmu_update
 
@@ -228,7 +229,8 @@ class PairStack(nn.Module):
                         use_deepspeed_evo_attention=use_deepspeed_evo_attention,
                         use_lma=use_lma,
                         inplace_safe=inplace_safe,
-                    )
+                    ),
+                    mask=self.pair_dropout_mask[2]
                 ),
                 inplace=inplace_safe,
                 )
@@ -247,7 +249,8 @@ class PairStack(nn.Module):
                         use_deepspeed_evo_attention=use_deepspeed_evo_attention,
                         use_lma=use_lma,
                         inplace_safe=inplace_safe,
-                    )
+                    ),
+                    mask=self.pair_dropout_mask[3]
                 ),
                 inplace=inplace_safe,
                 )
@@ -265,12 +268,13 @@ class PairStack(nn.Module):
 
         return z
 
-
 class MSABlock(nn.Module, ABC):
     @abstractmethod
     def __init__(self,
         c_m: int,
         c_z: int,
+        msa_dropout_mask: torch.Tensor,
+        pair_dropout_mask: torch.Tensor,
         c_hidden_msa_att: int,
         c_hidden_opm: int,
         c_hidden_mul: int,
@@ -309,9 +313,11 @@ class MSABlock(nn.Module, ABC):
             c_z,
             c_hidden_opm,
         )
+        self.msa_dropout_mask = msa_dropout_mask
 
         self.pair_stack = PairStack(
             c_z=c_z,
+            pair_dropout_mask=pair_dropout_mask
             c_hidden_mul=c_hidden_mul,
             c_hidden_pair_att=c_hidden_pair_att,
             no_heads_pair=no_heads_pair,
@@ -373,11 +379,12 @@ class MSABlock(nn.Module, ABC):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         pass
 
-
 class EvoformerBlock(MSABlock):
     def __init__(self,
         c_m: int,
         c_z: int,
+        msa_dropout_mask: torch.Tensor,
+        pair_dropout_mask: torch.Tensor,
         c_hidden_msa_att: int,
         c_hidden_opm: int,
         c_hidden_mul: int,
@@ -395,6 +402,8 @@ class EvoformerBlock(MSABlock):
     ):
         super(EvoformerBlock, self).__init__(c_m=c_m,
                                              c_z=c_z,
+                                             msa_dropout_mask=msa_dropout_mask,
+                                             pair_dropout_mask=pair_dropout_mask,
                                              c_hidden_msa_att=c_hidden_msa_att,
                                              c_hidden_opm=c_hidden_opm,
                                              c_hidden_mul=c_hidden_mul,
@@ -468,7 +477,8 @@ class EvoformerBlock(MSABlock):
                         use_memory_efficient_kernel=False,
                         use_deepspeed_evo_attention=use_deepspeed_evo_attention,
                         use_lma=use_lma,
-                    )
+                    ), 
+                    mask=self.msa_dropout_mask
                 ),
                 inplace=inplace_safe,
                 )
@@ -751,11 +761,12 @@ class EvoformerStack(nn.Module):
 
     Implements Algorithm 6.
     """
-
     def __init__(
         self,
         c_m: int,
         c_z: int,
+        msa_dropout_mask: torch.Tensor,
+        pair_dropout_mask: torch.Tensor,
         c_hidden_msa_att: int,
         c_hidden_opm: int,
         c_hidden_mul: int,
@@ -835,6 +846,8 @@ class EvoformerStack(nn.Module):
             block = EvoformerBlock(
                 c_m=c_m,
                 c_z=c_z,
+                msa_dropout_mask=msa_dropout_mask,
+                pair_dropout_mask=pair_dropout_mask,
                 c_hidden_msa_att=c_hidden_msa_att,
                 c_hidden_opm=c_hidden_opm,
                 c_hidden_mul=c_hidden_mul,
