@@ -317,7 +317,7 @@ class MSABlock(nn.Module, ABC):
 
         self.pair_stack = PairStack(
             c_z=c_z,
-            pair_dropout_mask=pair_dropout_mask
+            pair_dropout_mask=pair_dropout_mask,
             c_hidden_mul=c_hidden_mul,
             c_hidden_pair_att=c_hidden_pair_att,
             no_heads_pair=no_heads_pair,
