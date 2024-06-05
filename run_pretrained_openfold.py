@@ -188,8 +188,8 @@ def main(args):
         )
     
     # adding dropout masks to config
-    msa_dropout_mask = torch.load('msa_dropout_mask.pt')
-    pair_dropout_mask = torch.load('pair_dropout_mask.pt')
+    msa_dropout_mask = torch.load('msa_dropout_mask.pt').to(args.model_device)
+    pair_dropout_mask = torch.load('pair_dropout_mask.pt').to(args.model_device)
 
     config.model.evoformer_stack.msa_dropout_mask = msa_dropout_mask
     config.model.evoformer_stack.pair_dropout_mask = pair_dropout_mask
