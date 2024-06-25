@@ -226,7 +226,6 @@ class AlphaFold(nn.Module):
         # Controls whether the model uses in-place operations throughout
         # The dual condition accounts for activation checkpoints
         inplace_safe = not (self.training or torch.is_grad_enabled())
-
         # Prep some features
         seq_mask = feats["seq_mask"]
         pair_mask = seq_mask[..., None] * seq_mask[..., None, :]
@@ -385,6 +384,8 @@ class AlphaFold(nn.Module):
                     use_lma=self.globals.use_lma,
                     pair_mask=pair_mask.to(dtype=m.dtype),
                     _mask_trans=self.config._mask_trans,
+                    msa_dropout_mask=feats["extra_msa_dropout_mask"],
+                    pair_dropout_mask=feats["pair_dropout_mask"],
                 )
 
                 del input_tensors
@@ -399,6 +400,8 @@ class AlphaFold(nn.Module):
                     pair_mask=pair_mask.to(dtype=m.dtype),
                     inplace_safe=inplace_safe,
                     _mask_trans=self.config._mask_trans,
+                    msa_dropout_mask=feats["extra_msa_dropout_mask"],
+                    pair_dropout_mask=feats["pair_dropout_mask"],
                 )
 
         # Run MSA + pair embeddings through the trunk of the network
@@ -416,6 +419,8 @@ class AlphaFold(nn.Module):
                 use_deepspeed_evo_attention=self.globals.use_deepspeed_evo_attention,
                 use_lma=self.globals.use_lma,
                 _mask_trans=self.config._mask_trans,
+                msa_dropout_mask=feats["msa_dropout_mask"],
+                pair_dropout_mask=feats["pair_dropout_mask"],
             )
 
             del input_tensors
@@ -431,6 +436,8 @@ class AlphaFold(nn.Module):
                 use_flash=self.globals.use_flash,
                 inplace_safe=inplace_safe,
                 _mask_trans=self.config._mask_trans,
+                msa_dropout_mask=feats["msa_dropout_mask"],
+                pair_dropout_mask=feats["pair_dropout_mask"],
             )
 
         outputs["msa"] = m[..., :n_seq, :, :]
@@ -540,25 +547,36 @@ class AlphaFold(nn.Module):
                         for which C_alpha is used instead)
                     "template_pseudo_beta_mask" ([*, N_templ, N_res])
                         Pseudo-beta mask
+                    "pair_dropout_mask"
+                    "msa_dropout_mask"
+                        Dropout masks for the pair and MSA
         """
         # Initialize recycling embeddings
         m_1_prev, z_prev, x_prev = None, None, None
         prevs = [m_1_prev, z_prev, x_prev]
-
+        # TODO fix this properly
         is_grad_enabled = torch.is_grad_enabled()
-
+        # self._enable_activation_checkpointing()
         # Main recycling loop
         num_iters = batch["aatype"].shape[-1]
         early_stop = False
         num_recycles = 0
+        num_iters = 1
         for cycle_no in range(num_iters):
             # Select the features for the current recycling cycle
             fetch_cur_batch = lambda t: t[..., cycle_no]
             feats = tensor_tree_map(fetch_cur_batch, batch)
+            feats["pair_dropout_mask"] = batch["pair_dropout_mask"]
+            feats["msa_dropout_mask"] = batch["msa_dropout_mask"]
+            feats["extra_msa_dropout_mask"] = batch["extra_msa_dropout_mask"]
 
             # Enable grad iff we're training and it's the final recycling layer
             is_final_iter = cycle_no == (num_iters - 1) or early_stop
             with torch.set_grad_enabled(is_grad_enabled and is_final_iter):
+            # with torch.set_grad_enabled(is_grad_enabled):
+                print(f"Grad: {is_grad_enabled}")
+                print(f"Final iter: {is_final_iter}")
+                print(f"Iter: {cycle_no}")
                 if is_final_iter:
                     # Sidestep AMP bug (PyTorch issue #65766)
                     if torch.is_autocast_enabled():

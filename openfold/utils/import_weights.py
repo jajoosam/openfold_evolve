@@ -80,6 +80,22 @@ def process_translation_dict(d, top_layer=True):
 
     return flat
 
+def unflatten_dict(d, prefix="_NPZ_KEY_PREFIX"):
+    unflattened = {}
+    for k, v in d.items():
+        # Remove prefix if it exists
+        if k.startswith(prefix):
+            k = k[len(prefix):]
+
+        keys = k.split('/')
+        current_level = unflattened
+        for key in keys[:-1]:
+            if key not in current_level:
+                current_level[key] = {}
+            current_level = current_level[key]
+        current_level[keys[-1]] = v
+    return unflattened
+
 
 def stacked(param_dict_list, out=None):
     """
@@ -212,8 +228,9 @@ def generate_translation_dict(model, version, is_multimer=False):
         "attention": AttentionGatedParams(tri_att.mha),
     }
 
+
     def TriMulOutParams(tri_mul, outgoing=True):
-        if re.fullmatch("^model_[1-5]_multimer_v3$", version):
+        if re.fullmatch("^model_[1-5]_multimer_v.$", version):
             lin_param_type = LinearParams if outgoing else LinearParamsSwap
             d = {
                 "left_norm_input": LayerNormParams(tri_mul.layer_norm_in),
@@ -646,20 +663,75 @@ def generate_translation_dict(model, version, is_multimer=False):
     return translations
 
 
+def flat_params_to_haiku(params, fuse=None):
+  """Convert a dictionary of NumPy arrays to Haiku parameters."""
+  P = {}
+  for path, array in params.items():
+    scope, name = path.split('//')
+    if scope not in P:
+      P[scope] = {}
+    P[scope][name] = np.array(array)
+  if fuse is not None:
+    for a in ["evoformer_iteration",
+              "extra_msa_stack",
+              "template_embedding/single_template_embedding/template_embedding_iteration",
+              "template_embedding/single_template_embedding/template_pair_stack/__layer_stack_no_state"]:
+      for b in ["triangle_multiplication_incoming","triangle_multiplication_outgoing"]:
+        k = f"alphafold/alphafold_iteration/evoformer/{a}/{b}"
+
+        if fuse and f"{k}/center_layer_norm" in P:
+          for c in ["gate","projection"]:
+            L = P.pop(f"{k}/left_{c}")
+            R = P.pop(f"{k}/right_{c}")
+            P[f"{k}/{c}"] = {}
+            for d in ["bias","weights"]:
+              P[f"{k}/{c}"][d] = np.concatenate([L[d],R[d]],-1)
+          P[f"{k}/center_norm"] = P.pop(f"{k}/center_layer_norm")
+          P[f"{k}/left_norm_input"] = P.pop(f"{k}/layer_norm_input")
+
+        if not fuse and f"{k}/center_norm" in P:
+          for c in ["gate","projection"]:
+            LR = P.pop(f"{k}/{c}")
+            P[f"{k}/left_{c}"] = {}
+            P[f"{k}/right_{c}"] = {}
+            for d in ["bias","weights"]:
+              half = LR[d].shape[-1] // 2
+              P[f"{k}/left_{c}"][d] = LR[d][...,:half]
+              P[f"{k}/right_{c}"][d] = LR[d][...,half:]
+          P[f"{k}/center_layer_norm"] = P.pop(f"{k}/center_norm")
+          P[f"{k}/layer_norm_input"] = P.pop(f"{k}/left_norm_input")
+    full_flat = {}
+    for k in P.keys():
+        for k2 in P[k].keys():
+            full_flat[f"{k}//{k2}"] = P[k][k2]
+  return full_flat
+
 def import_jax_weights_(model, npz_path, version="model_1"):
-    data = np.load(npz_path)
-    translations = generate_translation_dict(model, version, is_multimer=("multimer" in version))
+    data = np.load(npz_path)    
+    # data = process_translation_dict(data) # flatten keys
+    # print("1st")
+    # print(data.keys()) # print keys
+    data = flat_params_to_haiku(data, fuse=True) # unfuse params
+    original_keys = list(data.keys())
+
+    # data = unflatten_dict(data) # unflatten keys
+    # print("2nd")
+    # print(data.keys()) # print keys
+
+    translations = generate_translation_dict(model, version, is_multimer=("multimer" in version)) # translate params
 
     # Flatten keys and insert missing key prefixes
-    flat = process_translation_dict(translations)
+    flat = process_translation_dict(translations) # flatten keys again
 
-    # Sanity check
-    keys = list(data.keys())
+    # print(original_keys)
+    # print("------------")
+    # print(flat.keys())
+
     flat_keys = list(flat.keys())
-    incorrect = [k for k in flat_keys if k not in keys]
-    missing = [k for k in keys if k not in flat_keys]
-    # print(f"Incorrect: {incorrect}")
-    # print(f"Missing: {missing}")
+    incorrect = [k for k in flat_keys if k not in original_keys]
+    missing = [k for k in original_keys if k not in flat_keys]
+    print(f"Incorrect: {incorrect}")
+    print(f"Missing: {missing}")
 
     assert len(incorrect) == 0
     # assert(sorted(list(flat.keys())) == sorted(list(data.keys())))

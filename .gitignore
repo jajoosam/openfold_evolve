@@ -10,3 +10,11 @@ data
 openfold/resources/
 tests/test_data/
 cutlass/
+
+output/
+references/
+alignment_dir/
+fasta_dir/
+wandb/
+
+.readthedocs.yaml

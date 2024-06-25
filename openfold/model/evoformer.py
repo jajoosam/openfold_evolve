@@ -119,7 +119,6 @@ class MSATransition(nn.Module):
 
         return m
 
-
 class PairStack(nn.Module):
     def __init__(
         self,
@@ -177,6 +176,7 @@ class PairStack(nn.Module):
     def forward(self,
         z: torch.Tensor,
         pair_mask: torch.Tensor,
+        pair_dropout_mask: torch.Tensor,
         chunk_size: Optional[int] = None,
         use_deepspeed_evo_attention: bool = False,
         use_lma: bool = False,
@@ -199,7 +199,7 @@ class PairStack(nn.Module):
             _add_with_inplace=True,
         )
         if (not inplace_safe):
-            z = z + self.ps_dropout_row_layer(tmu_update)
+            z = z + self.ps_dropout_row_layer(tmu_update, mask=pair_dropout_mask[0])
         else:
             z = tmu_update
 
@@ -212,10 +212,9 @@ class PairStack(nn.Module):
             _add_with_inplace=True,
         )
         if (not inplace_safe):
-            z = z + self.ps_dropout_row_layer(tmu_update)
+            z = z + self.ps_dropout_row_layer(tmu_update, mask=pair_dropout_mask[1])
         else:
             z = tmu_update
-
         del tmu_update
 
         z = add(z,
@@ -228,7 +227,8 @@ class PairStack(nn.Module):
                         use_deepspeed_evo_attention=use_deepspeed_evo_attention,
                         use_lma=use_lma,
                         inplace_safe=inplace_safe,
-                    )
+                    ),
+                    mask=pair_dropout_mask[2]
                 ),
                 inplace=inplace_safe,
                 )
@@ -247,7 +247,8 @@ class PairStack(nn.Module):
                         use_deepspeed_evo_attention=use_deepspeed_evo_attention,
                         use_lma=use_lma,
                         inplace_safe=inplace_safe,
-                    )
+                    ),
+                    mask=pair_dropout_mask[3]
                 ),
                 inplace=inplace_safe,
                 )
@@ -264,7 +265,6 @@ class PairStack(nn.Module):
         )
 
         return z
-
 
 class MSABlock(nn.Module, ABC):
     @abstractmethod
@@ -361,6 +361,8 @@ class MSABlock(nn.Module, ABC):
         z: Optional[torch.Tensor],
         msa_mask: torch.Tensor,
         pair_mask: torch.Tensor,
+        msa_dropout_mask: torch.Tensor,
+        pair_dropout_mask: torch.Tensor,
         chunk_size: Optional[int] = None,
         use_deepspeed_evo_attention: bool = False,
         use_lma: bool = False,
@@ -372,7 +374,6 @@ class MSABlock(nn.Module, ABC):
         _offloadable_inputs: Optional[Sequence[torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         pass
-
 
 class EvoformerBlock(MSABlock):
     def __init__(self,
@@ -425,6 +426,8 @@ class EvoformerBlock(MSABlock):
         z: Optional[torch.Tensor],
         msa_mask: torch.Tensor,
         pair_mask: torch.Tensor,
+        msa_dropout_mask: torch.Tensor,
+        pair_dropout_mask: torch.Tensor,
         chunk_size: Optional[int] = None,
         use_deepspeed_evo_attention: bool = False,
         use_lma: bool = False,
@@ -468,7 +471,8 @@ class EvoformerBlock(MSABlock):
                         use_memory_efficient_kernel=False,
                         use_deepspeed_evo_attention=use_deepspeed_evo_attention,
                         use_lma=use_lma,
-                    )
+                    ), 
+                    mask=msa_dropout_mask
                 ),
                 inplace=inplace_safe,
                 )
@@ -532,6 +536,7 @@ class EvoformerBlock(MSABlock):
         z = self.pair_stack(
             z=input_tensors[1],
             pair_mask=pair_mask,
+            pair_dropout_mask=pair_dropout_mask,
             chunk_size=chunk_size,
             use_deepspeed_evo_attention=use_deepspeed_evo_attention,
             use_lma=use_lma,
@@ -608,6 +613,8 @@ class ExtraMSABlock(MSABlock):
         z: Optional[torch.Tensor],
         msa_mask: torch.Tensor,
         pair_mask: torch.Tensor,
+        msa_dropout_mask: torch.Tensor,
+        pair_dropout_mask: torch.Tensor,
         chunk_size: Optional[int] = None,
         use_deepspeed_evo_attention: bool = False,
         use_lma: bool = False,
@@ -649,7 +656,7 @@ class ExtraMSABlock(MSABlock):
                     use_memory_efficient_kernel=not (use_lma or use_deepspeed_evo_attention),
                     _checkpoint_chunks=
                         self.ckpt if torch.is_grad_enabled() else False,
-                )
+                ), mask=msa_dropout_mask
             ),
             inplace=inplace_safe,
         )
@@ -722,7 +729,8 @@ class ExtraMSABlock(MSABlock):
                 use_lma=use_lma,
                 inplace_safe=inplace_safe,
                 _mask_trans=_mask_trans,
-                _attn_chunk_size=_attn_chunk_size
+                _attn_chunk_size=_attn_chunk_size,
+                pair_dropout_mask=pair_dropout_mask,
             )
 
             m = input_tensors[0]
@@ -751,7 +759,6 @@ class EvoformerStack(nn.Module):
 
     Implements Algorithm 6.
     """
-
     def __init__(
         self,
         c_m: int,
@@ -868,6 +875,8 @@ class EvoformerStack(nn.Module):
         use_flash: bool,
         msa_mask: Optional[torch.Tensor],
         pair_mask: Optional[torch.Tensor],
+        msa_dropout_mask: torch.Tensor,
+        pair_dropout_mask: torch.Tensor,
         inplace_safe: bool,
         _mask_trans: bool,
     ):
@@ -882,6 +891,8 @@ class EvoformerStack(nn.Module):
                 use_flash=use_flash,
                 inplace_safe=inplace_safe,
                 _mask_trans=_mask_trans,
+                msa_dropout_mask=msa_dropout_mask,
+                pair_dropout_mask=pair_dropout_mask,
             )
             for b in self.blocks
         ]
@@ -961,6 +972,8 @@ class EvoformerStack(nn.Module):
         msa_mask: torch.Tensor,
         pair_mask: torch.Tensor,
         chunk_size: int,
+        msa_dropout_mask: torch.Tensor,
+        pair_dropout_mask: torch.Tensor,
         use_deepspeed_evo_attention: bool = False,
         use_lma: bool = False,
         use_flash: bool = False,
@@ -1008,6 +1021,8 @@ class EvoformerStack(nn.Module):
             pair_mask=pair_mask,
             inplace_safe=inplace_safe,
             _mask_trans=_mask_trans,
+            msa_dropout_mask=msa_dropout_mask,
+            pair_dropout_mask=pair_dropout_mask,
         )
 
         blocks_per_ckpt = self.blocks_per_ckpt
@@ -1049,6 +1064,7 @@ class ExtraMSAStack(nn.Module):
         ckpt: bool,
         clear_cache_between_blocks: bool = False,
         tune_chunk_size: bool = False,
+        
         **kwargs,
     ):
         super(ExtraMSAStack, self).__init__()
@@ -1092,6 +1108,8 @@ class ExtraMSAStack(nn.Module):
         pair_mask: Optional[torch.Tensor],
         inplace_safe: bool,
         _mask_trans: bool,
+        msa_dropout_mask: torch.Tensor,
+        pair_dropout_mask: torch.Tensor,
     ):
         blocks = [
             partial(
@@ -1103,6 +1121,8 @@ class ExtraMSAStack(nn.Module):
                 use_lma=use_lma,
                 inplace_safe=inplace_safe,
                 _mask_trans=_mask_trans,
+                msa_dropout_mask=msa_dropout_mask,
+                pair_dropout_mask=pair_dropout_mask,
             ) for b in self.blocks
         ]
 
@@ -1141,6 +1161,8 @@ class ExtraMSAStack(nn.Module):
         msa_mask: Optional[torch.Tensor] = None,
         pair_mask: Optional[torch.Tensor] = None,
         _mask_trans: bool = True,
+        msa_dropout_mask: Optional[torch.Tensor] = None,
+        pair_dropout_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert(not (self.training or torch.is_grad_enabled()))
         blocks = self._prep_blocks(
@@ -1155,6 +1177,8 @@ class ExtraMSAStack(nn.Module):
             pair_mask=pair_mask,
             inplace_safe=True,
             _mask_trans=_mask_trans,
+            msa_dropout_mask=msa_dropout_mask,
+            pair_dropout_mask=pair_dropout_mask,    
         )
 
         for b in blocks:
@@ -1180,6 +1204,8 @@ class ExtraMSAStack(nn.Module):
         use_lma: bool = False,
         inplace_safe: bool = False,
         _mask_trans: bool = True,
+        msa_dropout_mask: Optional[torch.Tensor] = None,
+        pair_dropout_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -1208,6 +1234,8 @@ class ExtraMSAStack(nn.Module):
             pair_mask=pair_mask,
             inplace_safe=inplace_safe,
             _mask_trans=_mask_trans,
+            msa_dropout_mask=msa_dropout_mask,
+            pair_dropout_mask=pair_dropout_mask,
         )
 
         for b in blocks:

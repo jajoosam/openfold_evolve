@@ -1,23 +1,7 @@
-# Copyright 2021 AlQuraishi Laboratory
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-
 import torch
 import torch.nn as nn
 from functools import partialmethod
-from typing import Union, List
-
+from typing import Union, List, Optional
 
 class Dropout(nn.Module):
     """
@@ -43,20 +27,42 @@ class Dropout(nn.Module):
         self.batch_dim = batch_dim
         self.dropout = nn.Dropout(self.r)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
             x:
                 Tensor to which dropout is applied. Can have any shape
                 compatible with self.batch_dim
+            mask:
+                Optional pre-determined dropout mask. If provided, it should be
+                of the same shape as `x` or broadcastable to `x`.
         """
+        # print(f"any_nan pre: {torch.any(torch.isnan(x))}")
         shape = list(x.shape)
         if self.batch_dim is not None:
             for bd in self.batch_dim:
                 shape[bd] = 1
-        mask = x.new_ones(shape)
-        mask = self.dropout(mask)
+        if mask is None:
+            shape = list(x.shape)
+            if self.batch_dim is not None:
+                for bd in self.batch_dim:
+                    shape[bd] = 1
+            mask = x.new_ones(shape)
+            mask = self.dropout(mask)
+        else:
+            # binarize the mask
+            mask = torch.sigmoid(mask)
+            # since we're using the mask, we must also scale the input by the dropout rate
+            dropout_rate = 1 - torch.mean(mask)
+            dropped_x = x * mask
+            dropped_x *= 1 / (1 - dropout_rate)
+            # print(f"Scaling by {1 / (1 - dropout_rate)}")
+            # print(f"any_nan post: {torch.any(torch.isnan(x))}")
+            return dropped_x
+
         x *= mask
+
+        
         return x
 
 

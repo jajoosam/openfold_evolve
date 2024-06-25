@@ -232,7 +232,7 @@ def model_config(
         c.globals.offload_inference = True
         # Default to DeepSpeed memory-efficient attention kernel unless use_lma is explicitly set
         c.globals.use_deepspeed_evo_attention = True if not c.globals.use_lma else False
-        c.globals.use_flash = False
+        c.globals.use_flash = True
         c.model.template.offload_inference = True
         c.model.template.template_pair_stack.tune_chunk_size = False
         c.model.extra_msa.extra_msa_stack.tune_chunk_size = False
@@ -467,7 +467,7 @@ config = mlc.ConfigDict(
             "chunk_size": chunk_size,
             # Use DeepSpeed memory-efficient attention kernel. Mutually
             # exclusive with use_lma and use_flash.
-            "use_deepspeed_evo_attention": False,
+            "use_deepspeed_evo_attention": True,
             # Use Staats & Rabe's low-memory attention algorithm. Mutually
             # exclusive with use_deepspeed_evo_attention and use_flash.
             "use_lma": False,
@@ -475,7 +475,7 @@ config = mlc.ConfigDict(
             # use_deepspeed_evo_attention and use_lma. Doesn't work that well
             # on long sequences (>1000 residues).
             "use_flash": False,
-            "offload_inference": False,
+            "offload_inference": True,
             "c_z": c_z,
             "c_m": c_m,
             "c_t": c_t,
