@@ -356,7 +356,7 @@ run = wandb.init(
             "dropout_binarize": 1e-5,
             "plddt": 1e+0,
         },
-        "learning_rate": 3e-2,
+        "learning_rate": 3e-3,
         "target": names[target_index],
         "recycles": 0
     }
@@ -430,6 +430,7 @@ for i in range(10000):
     )
 
     out_detached = tensor_tree_map(lambda x: np.array(x.detach().cpu()), out)
+    print(out_detached.keys())
 
     unrelaxed_protein = prep_output(
         out_detached,

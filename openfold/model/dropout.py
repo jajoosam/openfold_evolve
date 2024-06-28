@@ -52,8 +52,13 @@ class Dropout(nn.Module):
         else:
             # binarize the mask
             mask = torch.sigmoid(mask)
+            extremified_mask = mask # + (torch.rand_like(mask)-0.5)*0.5
+            extremified_mask = torch.sigmoid(extremified_mask)
+            extremified_mask_hard = (extremified_mask > 0.5).float()
+            extremified_mask = extremified_mask + (extremified_mask_hard - extremified_mask).detach()
             # since we're using the mask, we must also scale the input by the dropout rate
             dropout_rate = 1 - torch.mean(mask)
+            # print(dropout_rate)
             dropped_x = x * mask
             dropped_x *= 1 / (1 - dropout_rate)
             # print(f"Scaling by {1 / (1 - dropout_rate)}")

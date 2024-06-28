@@ -1,16 +1,16 @@
-from openfold.model.model import AlphaFold
-from openfold.config import model_config
 import torch
 import torch.nn as nn
+
+from openfold.model.model import AlphaFold
+from openfold.config import model_config
+
 from openfold.data.tools import hhsearch, hmmsearch
 from openfold.data import templates, feature_pipeline, data_pipeline
-from openfold.utils.script_utils import (load_models_from_command_line, parse_fasta, run_model,
-                                         prep_output, relax_protein)
+from openfold.utils.script_utils import prep_output
 from openfold.np import protein
-from openfold.utils.import_weights import (
-    import_jax_weights_,
-    import_openfold_weights_
-)
+from openfold.utils.import_weights import import_jax_weights_
+from openfold.utils.tensor_utils import tensor_tree_map
+
 
 import numpy as np
 import wandb
@@ -18,21 +18,21 @@ import wandb
 import os
 import logging
 
-import subprocess
-import re
-
-from openfold.utils.tensor_utils import tensor_tree_map
+from utils import (
+    run_mmalign_and_get_tmscore,
+    setup_template_featurizer,
+    setup_data_processor,
+    precompute_alignments,
+    generate_feature_dict,
+    get_fape_loss
+)
 
 
 logging.basicConfig()
 logger = logging.getLogger(__file__)
 logger.setLevel(level=logging.INFO)
 
-config = model_config(
-    "model_1_multimer_v3",
-    True,
-    False
-)
+config = model_config("model_1_multimer_v3", True, False)
 
 
 args = {
@@ -43,7 +43,7 @@ args = {
     "hmmbuild_binary_path": "/home/ubuntu/miniforge3/envs/openfold_env/bin/hmmbuild",
     "kalign_binary_path": "/home/ubuntu/miniforge3/envs/openfold_env/bin/kalign",
     "pdb_seqres_database_path": "data/pdb_seqres/pdb_seqres.txt",
-    "template_mmcif_dir": "data/pdb_mmcif/mmcif_files",
+    "template_mmcif_dir": "data/pdb_mmcif/mmcif_files/",
     "max_template_date": "3000-01-01",
     "max_hits": 4,
     "mgnify_database_path": "data/mgnify/mgy_clusters_2022_05.fa",
@@ -58,171 +58,37 @@ args = {
     "model_device": "cuda:0",
 }
 
-args["jax_param_path"] = os.path.join(
-    "openfold", "resources", "params", "v2.2",
-    "params_" + args["config_preset"] + ".npz"
+args["jax_param_path"] = (
+    f"openfold/resources/params/v2.2/params_{args['config_preset']}.npz"
 )
 
+
 def get_model_basename(model_path):
-    return os.path.splitext(
-                os.path.basename(
-                    os.path.normpath(model_path)
-                )
-            )[0]
+    return os.path.splitext(os.path.basename(os.path.normpath(model_path)))[0]
 
 
 model_basename = get_model_basename(args["jax_param_path"])
 model_version = "_".join(model_basename.split("_")[1:])
 model = AlphaFold(config)
-# model = model.eval()
-import_jax_weights_(
-    model, args["jax_param_path"], version=model_version
-)
-
+import_jax_weights_(model, args["jax_param_path"], version=model_version)
 model = model.to(args["model_device"])
 model = model.train()
 
 
-
-template_searcher = hmmsearch.Hmmsearch(
-    binary_path=args["hmmsearch_binary_path"],
-    hmmbuild_binary_path=args["hmmbuild_binary_path"],
-    database_path=args["pdb_seqres_database_path"],
-)
-
-template_featurizer = templates.HmmsearchHitFeaturizer(
-    mmcif_dir=args["template_mmcif_dir"],
-    max_template_date=args["max_template_date"],
-    max_hits=config["data"]["predict"]["max_templates"],
-    kalign_binary_path=args["kalign_binary_path"],
-)
-
-
-alignment_runner = data_pipeline.AlignmentRunner(
-    jackhmmer_binary_path=args["jackhmmer_binary_path"],
-    hhblits_binary_path=args["hhblits_binary_path"],
-    uniref90_database_path=args["uniref90_database_path"],
-    mgnify_database_path=args["mgnify_database_path"],
-    bfd_database_path=args["bfd_database_path"],
-    uniref30_database_path=args["uniref30_database_path"],
-    uniprot_database_path=args["uniprot_database_path"],
-    template_searcher=template_searcher,
-    no_cpus=args["cpus"],
-)
-
-
-data_processor = data_pipeline.DataPipeline(
-    template_featurizer=template_featurizer,
-)
-
-data_processor = data_pipeline.DataPipelineMultimer(
-    monomer_data_pipeline=data_processor,
-)
-
+data_processor = setup_data_processor(None)
 feature_processor = feature_pipeline.FeaturePipeline(config["data"])
 
-def precompute_alignments(tags, seqs, alignment_dir, args):
-    for tag, seq in zip(tags, seqs):
-        tmp_fasta_path = os.path.join(args["output_dir"], f"tmp_{os.getpid()}.fasta")
-        with open(tmp_fasta_path, "w") as fp:
-            fp.write(f">{tag}\n{seq}")
-
-        local_alignment_dir = os.path.join(alignment_dir, tag)
-
-        if args["use_precomputed_alignments"] is None:
-            logger.info(f"Generating alignments for {tag}...")
-
-            os.makedirs(local_alignment_dir, exist_ok=True)
-
-            if "multimer" in args["config_preset"]:
-                template_searcher = hmmsearch.Hmmsearch(
-                    binary_path=args["hmmsearch_binary_path"],
-                    hmmbuild_binary_path=args["hmmbuild_binary_path"],
-                    database_path=args["pdb_seqres_database_path"],
-                )
-            else:
-                template_searcher = hhsearch.HHSearch(
-                    binary_path=args["hhsearch_binary_path"],
-                    databases=[args["pdb70_database_path"]],
-                )
-
-
-            alignment_runner = data_pipeline.AlignmentRunner(
-                jackhmmer_binary_path=args["jackhmmer_binary_path"],
-                hhblits_binary_path=args["hhblits_binary_path"],
-                uniref90_database_path=args["uniref90_database_path"],
-                mgnify_database_path=args["mgnify_database_path"],
-                bfd_database_path=args["bfd_database_path"],
-                uniref30_database_path=args["uniref30_database_path"],
-                # uniclust30_database_path=args["uniclust30_database_path"],
-                uniprot_database_path=args["uniprot_database_path"],
-                template_searcher=template_searcher,
-                use_small_bfd=args["bfd_database_path"] is None,
-                no_cpus=args["cpus"]
-            )
-
-            alignment_runner.run(
-                tmp_fasta_path, local_alignment_dir
-            )
-            logger.info("Alignment done!")
-        else:
-            logger.info(
-                f"Using precomputed alignments for {tag} at {alignment_dir}..."
-            )
-
-        # Remove temporary FASTA file
-        os.remove(tmp_fasta_path)
-
-def generate_feature_dict(
-    tags,
-    seqs,
-    alignment_dir,
-    data_processor,
-    args,
-):
-    tmp_fasta_path = os.path.join(args["output_dir"], f"tmp_{os.getpid()}.fasta")
-
-    if "multimer" in args["config_preset"]:
-        with open(tmp_fasta_path, "w") as fp:
-            fp.write(
-                '\n'.join([f">{tag}\n{seq}" for tag, seq in zip(tags, seqs)])
-            )
-        feature_dict = data_processor.process_fasta(
-            fasta_path=tmp_fasta_path, alignment_dir=alignment_dir,
-        )
-    elif len(seqs) == 1:
-        tag = tags[0]
-        seq = seqs[0]
-        with open(tmp_fasta_path, "w") as fp:
-            fp.write(f">{tag}\n{seq}")
-
-        local_alignment_dir = os.path.join(alignment_dir, tag)
-        feature_dict = data_processor.process_fasta(
-            fasta_path=tmp_fasta_path,
-            alignment_dir=local_alignment_dir,
-            seqemb_mode=args["use_single_seq_mode"],
-        )
-    else:
-        with open(tmp_fasta_path, "w") as fp:
-            fp.write(
-                '\n'.join([f">{tag}\n{seq}" for tag, seq in zip(tags, seqs)])
-            )
-        feature_dict = data_processor.process_multiseq_fasta(
-            fasta_path=tmp_fasta_path, super_alignment_dir=alignment_dir,
-        )
-
-    # Remove temporary FASTA file
-    os.remove(tmp_fasta_path)
-
-    return feature_dict
 
 names = [
+    "H1144",
     "H1106",
     "T1173",
-    "T1123",
-    "H1144"
 ]
 tags = [
+    [
+        "H1144-1",
+        "H1144-2",
+    ],
     [
         "H1106-1",
         "H1106-2",
@@ -232,220 +98,387 @@ tags = [
         "T1173-2",
         "T1173-3",
     ],
-    [
-        "T1123-1",
-        "T1123-2",
-    ],
-    [
-        "H1144-1",
-        "H1144-2",
-    ]
 ]
 seqs = [
     [
-        "MSRIITAPHIGIEKLSAISLEELSCGLPDRYALPPDGHPVEPHLERLYPTAQSKRSLWDFASPGYTFHGLHRAQDYRRELDTLQSLLTTSQSSELQAAAALLKCQQDDDRLLQIILNLLHKV",
-        "MNITLTKRQQEFLLLNGWLQLQCGHAERACILLDALLTLNPEHLAGRRCRLVALLNNNQGERAEKEAQWLISHDPLQAGNWLCLSRAQQLNGDLDKARHAYQHYLELKDHNESP"
-    ],
-    [
-        "NASINFVATEAHTASAGGAKIIFNTTNNGATGSTEKVVIDQNGNVGVGVGAPTAKMDVNGGIKQPNYGIISAVRNSGGVTASMPWTNAYVLAHQGEMHQWVAGGPILQDSVTGCNAGPDAGVKFDSIATSWGGPYKVIFHTTGSNGAIHLEWSGWQVSLKNSAGTELAIGMGQVFATLHYDPAVSNWRVEHMFGRINNTNFTCW",
-        "NASINFVATEAHTASAGGAKIIFNTTNNGATGSTEKVVIDQNGNVGVGVGAPTAKMDVNGGIKQPNYGIISAVRNSGGVTASMPWTNAYVLAHQGEMHQWVAGGPILQDSVTGCNAGPDAGVKFDSIATSWGGPYKVIFHTTGSNGAIHLEWSGWQVSLKNSAGTELAIGMGQVFATLHYDPAVSNWRVEHMFGRINNTNFTCW",
-        "NASINFVATEAHTASAGGAKIIFNTTNNGATGSTEKVVIDQNGNVGVGVGAPTAKMDVNGGIKQPNYGIISAVRNSGGVTASMPWTNAYVLAHQGEMHQWVAGGPILQDSVTGCNAGPDAGVKFDSIATSWGGPYKVIFHTTGSNGAIHLEWSGWQVSLKNSAGTELAIGMGQVFATLHYDPAVSNWRVEHMFGRINNTNFTCW"
-    ],
-    [
-        "MHHHHHHHHHHSETTYTGPRSIVTPETPIGPSSYPMTPSSLVLMAGYFSGPEISDNFGKYMPLLFQQNTSKVTFRSGSHTIKIVSMVLVDRLMWLDKHFNQYTNEPDGVFGDVGNVFVDNDNVAKVITMSGSSAPANRGATLMLCRATKNIQTFNFAATVYIPAYKVKDGAGGKDVVLNVAQWEANKTLTYPAIPKDTYFMVVTMGGASFTIQRYVVYNEGIGDGLELPAFWGKYLSQLYGFSWSSPTYACVTWEPIYAEEGIPHR",
-        "MHHHHHHHHHHSETTYTGPRSIVTPETPIGPSSYPMTPSSLVLMAGYFSGPEISDNFGKYMPLLFQQNTSKVTFRSGSHTIKIVSMVLVDRLMWLDKHFNQYTNEPDGVFGDVGNVFVDNDNVAKVITMSGSSAPANRGATLMLCRATKNIQTFNFAATVYIPAYKVKDGAGGKDVVLNVAQWEANKTLTYPAIPKDTYFMVVTMGGASFTIQRYVVYNEGIGDGLELPAFWGKYLSQLYGFSWSSPTYACVTWEPIYAEEGIPHR"
-    ],
-    [
         "GLEKDFLPLYFGWFLTKKSSETLRKAGQVFLEELGNHKAFKKELRHFISGDEPKEKLELVSYFGKRPPGVLHCTTKFCDYKAAGAEEYAQQEVVKRSYGKAFKLSISALFVTPKTAGAQVVLTDQELQLWPSDLDKPSASEGLPPGSRAHVTLGCAADVQPVQTGLDLLDILQQVKGGSQGEAVGELPRGKLYSLGKGRWMLSLTKKMEVKAIFTGYYG",
-        "EVQLEESGGGLVQPGGSLRLSCAASGFTFSSYVMSWVRQAPGKGLEWVSDINSGGSRTYYTDSVKGRFTISRDNAKNTLYLQMNSLKPEDTAVYYCARDSLLSTRYLHTSERGQGTQVTVSS"
-    ]
+        "EVQLEESGGGLVQPGGSLRLSCAASGFTFSSYVMSWVRQAPGKGLEWVSDINSGGSRTYYTDSVKGRFTISRDNAKNTLYLQMNSLKPEDTAVYYCARDSLLSTRYLHTSERGQGTQVTVSS",
+    ],
+    [
+        "MSRIITAPHIGIEKLSAISLEELSCGLPDRYALPPDGHPVEPHLERLYPTAQSKRSLWDFASPGYTFHGLHRAQDYRRELDTLQSLLTTSQSSELQAAAALLKCQQDDDRLLQIILNLLHKV",
+        "MNITLTKRQQEFLLLNGWLQLQCGHAERACILLDALLTLNPEHLAGRRCRLVALLNNNQGERAEKEAQWLISHDPLQAGNWLCLSRAQQLNGDLDKARHAYQHYLELKDHNESP",
+    ],
+    [
+        "NASINFVATEAHTASAGGAKIIFNTTNNGATGSTEKVVIDQNGNVGVGVGAPTAKMDVNGGIKQPNYGIISAVRNSGGVTASMPWTNAYVLAHQGEMHQWVAGGPILQDSVTGCNAGPDAGVKFDSIATSWGGPYKVIFHTTGSNGAIHLEWSGWQVSLKNSAGTELAIGMGQVFATLHYDPAVSNWRVEHMFGRINNTNFTCW",
+        "NASINFVATEAHTASAGGAKIIFNTTNNGATGSTEKVVIDQNGNVGVGVGAPTAKMDVNGGIKQPNYGIISAVRNSGGVTASMPWTNAYVLAHQGEMHQWVAGGPILQDSVTGCNAGPDAGVKFDSIATSWGGPYKVIFHTTGSNGAIHLEWSGWQVSLKNSAGTELAIGMGQVFATLHYDPAVSNWRVEHMFGRINNTNFTCW",
+        "NASINFVATEAHTASAGGAKIIFNTTNNGATGSTEKVVIDQNGNVGVGVGAPTAKMDVNGGIKQPNYGIISAVRNSGGVTASMPWTNAYVLAHQGEMHQWVAGGPILQDSVTGCNAGPDAGVKFDSIATSWGGPYKVIFHTTGSNGAIHLEWSGWQVSLKNSAGTELAIGMGQVFATLHYDPAVSNWRVEHMFGRINNTNFTCW",
+    ],
 ]
 
-target_index = 3
-
-precompute_alignments(tags[target_index], seqs[target_index], args["alignment_dir"], args)
-
-# TODO: generate_feature_dict 
-
-feature_dict = generate_feature_dict(
-    tags[target_index],
-    seqs[target_index],
-    args["alignment_dir"],
-    data_processor,
-    args,
-)
-
-processed_feature_dict = feature_processor.process_features(
-    feature_dict, mode='predict', is_multimer=True
-)
-
-processed_feature_dict = {
-    k: torch.as_tensor(v).to(args["model_device"])
-    for k, v in processed_feature_dict.items()
-}
-
-template_enabled = model.config["template"]["enabled"]
-
-model.config["template"]["enabled"] = template_enabled and any([
-    "template_" in k for k in processed_feature_dict
-])
-
-num_residues = np.array([len(seq) for seq in seqs[target_index]]).sum()
-channels_msa = 256
-channels_msa_extra = 64
-channels_pair = 128
-dropout_rate = 0.15
-
-torch.set_grad_enabled(True)
 
 class DropoutMaskOptimizer(nn.Module):
     def __init__(self, num_residues, channels_msa, channels_msa_extra, channels_pair):
         super(DropoutMaskOptimizer, self).__init__()
-        # sigmoid shenanigans
-        self.msa_dropout_mask = nn.Parameter((1 - dropout_rate)*2 * (torch.rand(num_residues, channels_msa) * 8) - 4)
-        self.pair_dropout_mask = nn.Parameter((1 - dropout_rate)*2 * (torch.rand(4, num_residues, channels_pair) * 8) - 4)
-        self.extra_msa_dropout_mask = nn.Parameter((1 - dropout_rate)*2 * (torch.rand(num_residues, channels_msa_extra) * 8) - 4)
-        
+        self.msa_dropout_mask = nn.Parameter(
+            (torch.rand(num_residues, channels_msa) - 0.5)
+        )
+        self.pair_dropout_mask = nn.Parameter(
+            (torch.rand(4, num_residues, channels_pair) - 0.5)
+        )
+        self.extra_msa_dropout_mask = nn.Parameter(
+            (torch.rand(num_residues, channels_msa_extra) - 0.5)
+        )
 
-    def forward(self):
-        return {
+    def forward(self, noise=0.0, binarized=False):
+        masks = {
             "msa_dropout_mask": self.msa_dropout_mask,
             "pair_dropout_mask": self.pair_dropout_mask,
             "extra_msa_dropout_mask": self.extra_msa_dropout_mask,
         }
 
+        # if noise > 0:
+        #     for key in masks:
+        #         masks[key] = masks[key] + (torch.rand_like(masks[key]) - 0.5) * noise
 
+        # for key in masks:
+        #     masks[key] = torch.sigmoid(masks[key])
 
-def run_mmalign_and_get_tmscore(reference, model):
-    # Define the command
-    command = ["./../USalign/MMalign", reference, model]
-    
-    # Run the command and capture the output
-    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    
-    # Check if the command was successful
-    if result.returncode != 0:
-        print("Error running MM-align:")
-        print(result.stderr)
-        return None
-    
-    # Extract the TM-score from the output
-    output = result.stdout
-    tm_score_match = re.search(r"TM-score=\s+([\d\.]+)", output)
-    
-    if tm_score_match:
-        tm_score = float(tm_score_match.group(1))
-        return torch.tensor(tm_score)
-    else:
-        return torch.nan
+        # if binarized:
+        #     for key in masks:
+        #         hard_mask = (masks[key] > 0.5).float()
+        #         masks[key] = hard_mask + (hard_mask - masks[key]).detach()
 
-# Example usage
+        return masks
 
+    def get_dropout_rates(self, masks):
+        return {
+            "msa_dropout_rate": 1 - masks["msa_dropout_mask"].mean(),
+            "pair_dropout_rate": 1 - masks["pair_dropout_mask"].mean(),
+            "extra_msa_dropout_rate": 1 - masks["extra_msa_dropout_mask"].mean(),
+        }
 
-# # Initialize the DropoutMaskOptimizer
-dropout_mask_optimizer = DropoutMaskOptimizer(num_residues, channels_msa, channels_msa_extra, channels_pair).to(args["model_device"]).train()
-
-
-run = wandb.init(
-    project="af_dropout",
-    config={
-        "args"    : args,
-        "loss_weights": {
-            "weighted_ptm_score": 0,
-            "dropout_rate": 0, # 3e+3,
-            "dropout_binarize": 9e+2,
-            "plddt": 0,
-            "pae": 1
-        },
-        "learning_rate": 3e-2,
-        "target": names[target_index],
-        "recycles": 0
-    }
-)
-
-
-
-# # Pass the learnable parameters to the optimizer
-optimizer = torch.optim.Adam(dropout_mask_optimizer.parameters(), lr=run.config["learning_rate"])
-
-# msa_dropout_mask = torch.ones(num_residues, channels_msa)
-# pair_dropout_mask = torch.ones(4, num_residues, channels_pair)
-# extra_msa_dropout_mask = torch.ones(num_residues, channels_msa_extra)
-
-# Training loop
-for i in range(600):
-    
-    processed_feature_dict.update(dropout_mask_optimizer())
-    out = model(processed_feature_dict)
-
-    weighted_ptm_score =  out["weighted_ptm_score"]
-    plddt = out["plddt"].mean()
-    pae = out["predicted_aligned_error"].mean()
-    print(f"Weighted ptm score: {weighted_ptm_score}")
-    print(f"PAE: {pae}")
-
-    sigmoided_msa_dropout_mask = torch.sigmoid(processed_feature_dict["msa_dropout_mask"])
-    sigmoided_pair_dropout_mask = torch.sigmoid(processed_feature_dict["pair_dropout_mask"])
-    sigmoided_extra_msa_dropout_mask = torch.sigmoid(processed_feature_dict["extra_msa_dropout_mask"])
-
+    @staticmethod
     def get_binarization_loss(sigmoided_values):
-        loss = -1 * ((sigmoided_values * torch.log(sigmoided_values)) + (1 - sigmoided_values) * torch.log(1 - sigmoided_values)).mean()
-        return loss
+        return -1 * (
+            (sigmoided_values * torch.log(sigmoided_values))
+            + (1 - sigmoided_values) * torch.log(1 - sigmoided_values)
+        ).mean()
 
-    msa_dropout_rate = 1 -sigmoided_msa_dropout_mask.mean()
-    pair_dropout_rate = 1 - sigmoided_pair_dropout_mask.mean()
-    extra_msa_dropout_rate = 1 -sigmoided_extra_msa_dropout_mask.mean()
+    def compute_binarization_loss(self, masks):
+        for key in masks:
+            masks[key] = torch.sigmoid(masks[key])
+        return sum(self.get_binarization_loss(mask) for mask in masks.values())
 
-
-    ptm_loss = -1 * run.config["loss_weights"]["weighted_ptm_score"] * weighted_ptm_score 
-    dropout_rate_loss = run.config["loss_weights"]["dropout_rate"] * ((msa_dropout_rate - dropout_rate)**2 + (pair_dropout_rate - dropout_rate)**2 + (extra_msa_dropout_rate - dropout_rate)**2).sum()
-    dropout_binarize_loss = run.config["loss_weights"]["dropout_binarize"] * (get_binarization_loss(sigmoided_msa_dropout_mask) + get_binarization_loss(sigmoided_pair_dropout_mask) + get_binarization_loss(sigmoided_extra_msa_dropout_mask))
-    plddt_loss = -1 * run.config["loss_weights"]["plddt"] * plddt
-    pae_loss = run.config["loss_weights"]["pae"] * pae
-
-    loss = ptm_loss + dropout_rate_loss + dropout_binarize_loss + plddt_loss + pae_loss
-
-    print(f"Loss: {loss}")
-    loss.backward()
-
-    
-
-    optimizer.step()
-    optimizer.zero_grad()
-
-    processed_feature_dict_detached = tensor_tree_map(
-    lambda x: np.array(x[..., -1].detach().cpu()),
-    processed_feature_dict
-    )
-
-    out_detached = tensor_tree_map(lambda x: np.array(x.detach().cpu()), out)
-
-    unrelaxed_protein = prep_output(
-        out_detached,
-        processed_feature_dict_detached,
-        feature_dict,
-        feature_processor,
-        args["config_preset"],
-        200,
-        False
-    )
+    def compute_dropout_rate_loss(self, target_rate, masks, binarized=False):
+        for key in masks:
+            masks[key] = torch.sigmoid(masks[key])
+        if(binarized):
+            for key in masks:
+                hard_mask = (masks[key] > 0.5).float()
+                masks[key] = hard_mask + (hard_mask - masks[key]).detach()
+        rates = self.get_dropout_rates(masks)
+        return sum((rate - target_rate) ** 2 for rate in rates.values())
 
 
-    unrelaxed_output_path = os.path.join(
-        args["output_dir"], f'{names[target_index]}_{i}_unrelaxed.pdb'
-    )
+class DistogramHistoryLoss:
+    def __init__(self, device):
+        self.history = []
+        self.device = device
 
-    with open(unrelaxed_output_path, 'w') as fp:
-            fp.write(protein.to_pdb(unrelaxed_protein))
+    def add_to_history(self, distogram, tm_score):
+        self.history.append((distogram.detach().clone(), tm_score.detach().clone()))
 
-    # NOTE: order of args is important here
-    tm_score = run_mmalign_and_get_tmscore(f"references/{names[target_index]}.pdb", unrelaxed_output_path)
-    predicted_tm_score = out["weighted_ptm_score"]
+    def compute_loss(self, current_distogram):
+        if not self.history:
+            return torch.tensor(0.0, device=self.device)
 
-    print(f"plddt: {out['plddt'].mean()}")
-    print(f"tm_score: {tm_score}")
-    
-    # wandb.log({"plddt": out["plddt"].mean(), "tm_score": tm_score, "predicted_tm_score": predicted_tm_score})
+        total_loss = torch.tensor(0.0, device=self.device)
 
-    wandb.log({"plddt": out["plddt"].mean(), "tm_score": tm_score, "predicted_tm_score": predicted_tm_score, "ptm_loss": ptm_loss, "dropout_rate_loss": dropout_rate_loss, "pae_loss": pae_loss, "dropout_binarize_loss": dropout_binarize_loss, "plddt_loss": plddt_loss, "loss": loss})
+        for past_distogram, tm_score in self.history:
+            # Calculate the distance between the current distogram and the past one
+            distance = torch.norm(current_distogram - past_distogram)
 
+            # Weight the distance by the inverse of the TM score
+            # This encourages moving away from conformations with low TM scores
+            weighted_distance = distance * (1 - tm_score)
+
+            # We want to maximize this distance, so we use negative loss
+            total_loss += weighted_distance
+
+        # Normalize by the number of historical distograms
+        return -(total_loss / len(self.history)).sqrt()
+
+
+seeds = torch.randint(0, 1000, (3, 10, 3))  # 3 targets, 10 iterations, 3 diff seeds
+
+for target_index in range(1):
+    for iteration in range(5):
+        precompute_alignments(
+            tags[target_index], seqs[target_index], args["alignment_dir"], args
+        )
+
+        feature_dict = generate_feature_dict(
+            tags[target_index],
+            seqs[target_index],
+            args["alignment_dir"],
+            data_processor,
+            args,
+        )
+
+        processed_feature_dict = feature_processor.process_features(
+            feature_dict, mode="predict", is_multimer=True
+        )
+
+        processed_feature_dict = {
+            k: torch.as_tensor(v).to(args["model_device"])
+            for k, v in processed_feature_dict.items()
+        }
+
+        template_enabled = model.config["template"]["enabled"]
+
+        model.config["template"]["enabled"] = template_enabled and any(
+            ["template_" in k for k in processed_feature_dict]
+        )
+
+        num_residues = np.array([len(seq) for seq in seqs[target_index]]).sum()
+        channels_msa = 256
+        channels_msa_extra = 64
+        channels_pair = 128
+        dropout_rate = 0.15
+
+        torch.set_grad_enabled(True)
+        torch.manual_seed(seeds[target_index][iteration][0])
+
+        dropout_mask_optimizer = (
+            DropoutMaskOptimizer(
+                num_residues, channels_msa, channels_msa_extra, channels_pair
+            )
+            .to(args["model_device"])
+            .train()
+        )
+
+        distogram_history_loss = DistogramHistoryLoss(args["model_device"])
+
+        run = wandb.init(
+            project="af_dropout",
+            config={
+                "args": args,
+                "loss_weights": {
+                    "weighted_ptm_score": 0,  # 1 is ~ 0.5
+                    "dropout_rate": 0,  # 1 is ~ 0.33
+                    "dropout_binarize": 0,
+                    "plddt": 0,
+                    "pae": 3,  # 1 is ~15
+                    "distogram": 0,  # 1 is ~1000
+                    "delta_distogram": 0,  # 1 is ~300
+                    "history": 10, # 1 is ~10
+                    "joint_pae_fape": 15, # 1 is ~sqrt(500)
+                },
+                "learning_rate": 8e-4,
+                "target": names[target_index] + "_" + str(iteration),
+                "recycles": 0,
+                "seed_fixed": True,
+                "noise": 0,
+                "binarized": False,
+            },
+        )
+
+
+        optimizer = torch.optim.Adam(
+            dropout_mask_optimizer.parameters(), lr=run.config["learning_rate"]
+        )
+
+        reference_pdb = open(f"references/{names[target_index]}.pdb").read()
+        reference_structure = protein.from_pdb_string(reference_pdb)
+
+        reference_distogram = torch.zeros(num_residues, num_residues)
+        for i in range(num_residues):
+            for j in range(num_residues):
+                reference_distogram[i, j] = torch.norm(
+                    torch.tensor(reference_structure.atom_positions[i][1])
+                    - torch.tensor(reference_structure.atom_positions[j][1])
+                )
+
+        reference_distogram = reference_distogram.to(args["model_device"])
+
+
+        # things to preserve between iterations
+        prev_distogram = None
+        prev_pae = None
+        prev_pae_matrix = None
+        prev_atom_positions = None
+        old_masks = {}
+
+        torch.autograd.set_detect_anomaly(True)
+        # Training loop
+        for i in range(100):
+            optimizer.zero_grad()
+
+            masks = dropout_mask_optimizer(noise=run.config["noise"], binarized=run.config["binarized"])
+
+            current_feature_dict = {k: v.detach().clone() if isinstance(v, torch.Tensor) else v 
+                                    for k, v in processed_feature_dict.items()}
+            
+            current_feature_dict["msa_dropout_mask"] = masks["msa_dropout_mask"]
+            current_feature_dict["pair_dropout_mask"] = masks["pair_dropout_mask"]
+            current_feature_dict["extra_msa_dropout_mask"] = masks["extra_msa_dropout_mask"]
+
+
+            if i > 0:
+                delta_msa_dropout_mask = torch.abs(
+                    current_feature_dict["msa_dropout_mask"]
+                    - old_masks["msa_dropout_mask"]
+                )
+                delta_pair_dropout_mask = torch.abs(
+                    current_feature_dict["pair_dropout_mask"]
+                    - old_masks["pair_dropout_mask"]
+                )
+                delta_extra_msa_dropout_mask = torch.abs(
+                    current_feature_dict["extra_msa_dropout_mask"]
+                    - old_masks["extra_msa_dropout_mask"]
+                )
+                print(
+                    "MSA dropout mask change:",
+                    delta_msa_dropout_mask.mean(),
+                    torch.abs(current_feature_dict["msa_dropout_mask"]).mean(),
+                )
+                print(
+                    "Pair dropout mask change:",
+                    delta_pair_dropout_mask.mean(),
+                    torch.abs(current_feature_dict["pair_dropout_mask"]).mean(),
+                )
+                print(
+                    "Extra MSA dropout mask change:",
+                    delta_extra_msa_dropout_mask.mean(),
+                    torch.abs(current_feature_dict["extra_msa_dropout_mask"]).mean(),
+                )
+            
+            old_masks = {
+                "msa_dropout_mask": current_feature_dict["msa_dropout_mask"].clone(),
+                "pair_dropout_mask": current_feature_dict[
+                    "pair_dropout_mask"
+                ].clone(),
+                "extra_msa_dropout_mask": current_feature_dict[
+                    "extra_msa_dropout_mask"
+                ].clone(),
+            }
+
+            torch.manual_seed(seeds[target_index][iteration][1])
+            np.random.seed(seeds[target_index][iteration][2])
+
+            out = model(current_feature_dict)
+            print(f"Forward pass #{i} complete")
+
+            weighted_ptm_score = out["weighted_ptm_score"]
+            plddt = out["plddt"].mean()
+
+            print((f"original pae shape: { out['predicted_aligned_error'].shape}"))
+
+            pae_matrix = out["predicted_aligned_error"]            
+            pae = out["predicted_aligned_error"].mean()
+
+            print(f"Forward pass #{i} complete")
+
+            atom_positions = out["final_atom_positions"][:, 1, :]
+            distogram = torch.norm(atom_positions[:, None, :] - atom_positions[None, :, :], dim=2)
+            distogram = distogram.to(args["model_device"])
+
+            # Calculate losses
+            losses = {
+                "weighted_ptm_score": -run.config["loss_weights"]["weighted_ptm_score"] * out["weighted_ptm_score"],
+                "dropout_rate": run.config["loss_weights"]["dropout_rate"] * dropout_mask_optimizer.compute_dropout_rate_loss(dropout_rate, masks, binarized=run.config["binarized"]),
+                "dropout_binarize": run.config["loss_weights"]["dropout_binarize"] * dropout_mask_optimizer.compute_binarization_loss(masks),
+                "plddt": -run.config["loss_weights"]["plddt"] * out["plddt"].mean(),
+                "pae": run.config["loss_weights"]["pae"] * out["predicted_aligned_error"].mean(),
+                "distogram": run.config["loss_weights"]["distogram"] * torch.norm(distogram - reference_distogram),
+                "history": run.config["loss_weights"]["history"] * distogram_history_loss.compute_loss(distogram),
+            }
+
+            fape_change = torch.tensor(0)
+            pae_change = torch.tensor(0)
+            if i > 0:
+                losses["delta_distogram"] = -run.config["loss_weights"]["delta_distogram"] * torch.norm(distogram - prev_distogram)
+
+                fape_loss = get_fape_loss(prev_atom_positions, out["final_atom_positions"]) # N X N
+                delta_pae = torch.norm(pae_matrix - prev_pae_matrix) / 31.0
+
+                # for logging purposes
+                fape_change = fape_loss.clone()
+                pae_change = delta_pae.clone()
+
+                # normalize
+                fape_loss = fape_loss / fape_loss.mean()
+                delta_pae = delta_pae / delta_pae.mean()
+
+
+                losses["joint_pae_fape"] = run.config["loss_weights"]["joint_pae_fape"] * (
+                    torch.norm(
+                        fape_loss -
+                        delta_pae,
+                    )
+                ).sqrt()
+
+            losses["total"] = sum(losses.values())
+
+            loss = losses["total"]
+            print("Loss calculation complete")
+
+            loss.backward()
+            print("Backward pass complete")
+            optimizer.step()
+
+            distogram_history_loss.add_to_history(distogram, out["weighted_ptm_score"])
+
+
+            processed_feature_dict_detached = tensor_tree_map(
+                lambda x: np.array(x[..., -1].detach().cpu()), processed_feature_dict
+            )
+            prev_atom_positions = out["final_atom_positions"].detach().clone()
+
+            out_detached = tensor_tree_map(lambda x: np.array(x.detach().cpu()), out)
+
+            unrelaxed_protein = prep_output(
+                out_detached,
+                processed_feature_dict_detached,
+                feature_dict,
+                feature_processor,
+                args["config_preset"],
+                200,
+                False,
+            )
+
+            unrelaxed_output_path = os.path.join(
+                args["output_dir"], f"{names[target_index]}_{i}_unrelaxed.pdb"
+            )
+
+            with open(unrelaxed_output_path, "w") as fp:
+                fp.write(protein.to_pdb(unrelaxed_protein))
+
+
+            tm_score = run_mmalign_and_get_tmscore(f"references/{names[target_index]}.pdb", unrelaxed_output_path)
+            delta_tm = 1 - run_mmalign_and_get_tmscore(unrelaxed_output_path.replace(f"_{i}_", f"_{i-1}_"), unrelaxed_output_path) if i > 0 else 0
+
+            additional_metrics = {
+                "tm_score": tm_score,
+                "delta_tm": delta_tm,
+                "plddt": out["plddt"].mean().item(),
+                "pae": out["predicted_aligned_error"].mean().item(),
+                "ptm": out["weighted_ptm_score"].item(),
+                "fape_change": fape_change.sum().item(),
+                "pae_change": pae_change.sum().item(),
+            }
+
+            # Log all metrics
+            wandb.log({**losses, **additional_metrics})
+
+            print("Stats logged")
+
+            # Update previous data for next iteration
+            prev_distogram = distogram.detach().clone()
+            prev_pae = out["predicted_aligned_error"].mean().detach().clone()
+            prev_pae_matrix = out["predicted_aligned_error"].detach().clone()
+            prev_atom_positions = out["final_atom_positions"].detach().clone()
+
+
+
+        wandb.finish()
