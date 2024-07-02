@@ -222,6 +222,7 @@ class AlphaFold(nn.Module):
         n = feats["target_feat"].shape[-2]
         n_seq = feats["msa_feat"].shape[-3]
         device = feats["target_feat"].device
+        
 
         # Controls whether the model uses in-place operations throughout
         # The dual condition accounts for activation checkpoints

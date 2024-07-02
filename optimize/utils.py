@@ -9,7 +9,7 @@ from openfold.data.tools import hhsearch, hmmsearch
 
 def run_mmalign_and_get_tmscore(reference, model):
     # Define the command
-    command = ["./../USalign/MMalign", reference, model]
+    command = ["./../../USalign/MMalign", reference, model]
     
     # Run the command and capture the output
     result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -173,3 +173,16 @@ def get_fape_loss(inputs, outputs, copies=1, clamp=31.0):
     
     fape = loss_fn(true, pred)
     return fape
+
+def make_hard_mask(mask_logits, threshold=0.15):
+
+    mask_probs = torch.softmax(mask_logits.view(-1), dim=-1)
+    sorted_mask, _ = torch.sort(mask_probs, descending=False)
+    threshold_index = int(threshold * mask_logits.numel())
+    threshold = sorted_mask[threshold_index]
+
+    hard_mask = (mask_probs > threshold).float()
+    
+    hard_mask = hard_mask.view(mask_logits.shape)
+
+    return hard_mask

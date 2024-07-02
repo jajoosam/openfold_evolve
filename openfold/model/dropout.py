@@ -1,7 +1,21 @@
 import torch
 import torch.nn as nn
+import json
+import os
 from functools import partialmethod
 from typing import Union, List, Optional
+
+
+# Doing this in a jank way to prevent conflicts with OpenFold's checkpointing
+config_path = os.path.join('..', '..', 'optimize', 'tmp_dropout_config.json')
+with open(config_path, 'r') as config_file:
+    config = json.load(config_file)
+
+NOISE_FACTOR = config.get('NOISE_FACTOR', 0.1)  
+BINARIZE = config.get('BINARIZE', False)
+DROPOUT_RATE = config.get('DROPOUT_RATE', 0.5)
+
+
 
 class Dropout(nn.Module):
     """
@@ -50,20 +64,31 @@ class Dropout(nn.Module):
             mask = x.new_ones(shape)
             mask = self.dropout(mask)
         else:
-            # binarize the mask
-            mask = torch.sigmoid(mask)
-            extremified_mask = mask # + (torch.rand_like(mask)-0.5)*0.5
-            extremified_mask = torch.sigmoid(extremified_mask)
-            extremified_mask_hard = (extremified_mask > 0.5).float()
-            extremified_mask = extremified_mask + (extremified_mask_hard - extremified_mask).detach()
-            # since we're using the mask, we must also scale the input by the dropout rate
-            dropout_rate = 1 - torch.mean(mask)
-            # print(dropout_rate)
-            dropped_x = x * mask
+            correct_view_mask = mask.view(shape)
+
+            noise = torch.randn_like(correct_view_mask) * correct_view_mask.std() * NOISE_FACTOR
+            noised_mask = correct_view_mask + noise
+
+            sigmoided_mask = torch.sigmoid(noised_mask)
+
+            if(BINARIZE):
+                sorted_values, indices = torch.sort(sigmoided_mask.view(-1), descending=False)
+                threshold = sorted_values[int(sorted_values.numel() * DROPOUT_RATE)]
+
+                hard_mask = (sigmoided_mask > threshold).float()
+                extremified_mask = sigmoided_mask + (hard_mask - sigmoided_mask).detach()
+            else:
+                extremified_mask = sigmoided_mask
+
+
+            dropout_rate = 1 - torch.mean(extremified_mask)
+
+
+            dropped_x = x * extremified_mask
             dropped_x *= 1 / (1 - dropout_rate)
-            # print(f"Scaling by {1 / (1 - dropout_rate)}")
-            # print(f"any_nan post: {torch.any(torch.isnan(x))}")
-            return dropped_x
+            x = dropped_x
+
+            return x
 
         x *= mask
 
