@@ -6,6 +6,32 @@ import os
 import logging
 from openfold.data import templates, feature_pipeline, data_pipeline
 from openfold.data.tools import hhsearch, hmmsearch
+from scripts.precompute_embeddings import EmbeddingGenerator
+
+
+import json
+
+def run_tmalign_and_get_tmscore(reference, model):
+
+    command = ["../../USalign/TMalign", reference, model]
+
+    # Run the command and capture the output
+    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    # Check if the command was successful
+    if result.returncode != 0:
+        print("Error running TM-align:")
+        print(result.stderr)
+        return None
+    
+    output = result.stdout
+    tm_score_match = re.search(r"TM-score=\s+([\d\.]+)", output)
+    
+    if tm_score_match:
+        tm_score = float(tm_score_match.group(1))
+        return torch.tensor(tm_score)
+    else:
+        return torch.nan
 
 def run_mmalign_and_get_tmscore(reference, model):
     # Define the command
@@ -58,6 +84,7 @@ def setup_template_featurizer(args):
         kalign_binary_path=args["kalign_binary_path"],
     )
 
+
 def setup_alignment_runner(args, template_searcher):
     return data_pipeline.AlignmentRunner(
         jackhmmer_binary_path=args["jackhmmer_binary_path"],
@@ -72,23 +99,31 @@ def setup_alignment_runner(args, template_searcher):
         no_cpus=args["cpus"],
     )
 
-def setup_data_processor(template_featurizer):
+def setup_data_processor(template_featurizer, soloseq=False):
+
     monomer_data_pipeline = data_pipeline.DataPipeline(
         template_featurizer=template_featurizer,
     )
-    return data_pipeline.DataPipelineMultimer(
-        monomer_data_pipeline=monomer_data_pipeline,
-    )
+    if soloseq:
+        return monomer_data_pipeline
+    else:
+        return data_pipeline.DataPipelineMultimer(
+            monomer_data_pipeline=monomer_data_pipeline,
+        )
 
-def precompute_alignments(tags, seqs, alignment_dir, args):
+def precompute_alignments(tags, seqs, alignment_dir, args, soloseq=False):
     for tag, seq in zip(tags, seqs):
         tmp_fasta_path = os.path.join(args["output_dir"], f"tmp_{os.getpid()}.fasta")
         with open(tmp_fasta_path, "w") as fp:
             fp.write(f">{tag}\n{seq}")
 
         local_alignment_dir = os.path.join(alignment_dir, tag)
-
-        if not args["use_precomputed_alignments"]:
+        if soloseq:
+            # alignment_runner = setup_alignment_runner_soloseq(args, None)
+            embedding_generator = EmbeddingGenerator()
+            embedding_generator.run(tmp_fasta_path, local_alignment_dir)
+            # alignment_runner.run(tmp_fasta_path, local_alignment_dir)
+        elif not args["use_precomputed_alignments"]:
             logger.info(f"Generating alignments for {tag}...")
             os.makedirs(local_alignment_dir, exist_ok=True)
             
@@ -102,17 +137,20 @@ def precompute_alignments(tags, seqs, alignment_dir, args):
 
         os.remove(tmp_fasta_path)
 
-def generate_feature_dict(tags, seqs, alignment_dir, data_processor, args):
+def generate_feature_dict(tags, seqs, alignment_dir, data_processor, args, soloseq=False):
     tmp_fasta_path = os.path.join(args["output_dir"], f"tmp_{os.getpid()}.fasta")
 
     if "multimer" in args["config_preset"]:
         with open(tmp_fasta_path, "w") as fp:
             fp.write("\n".join([f">{tag}\n{seq}" for tag, seq in zip(tags, seqs)]))
+            for tag, seq in zip(tags, seqs):
+                print(f">{tag}\n{seq}")
         feature_dict = data_processor.process_fasta(
             fasta_path=tmp_fasta_path,
             alignment_dir=alignment_dir,
         )
     elif len(seqs) == 1:
+        print("generating feature dict soloseq")
         tag, seq = tags[0], seqs[0]
         with open(tmp_fasta_path, "w") as fp:
             fp.write(f">{tag}\n{seq}")
@@ -120,7 +158,7 @@ def generate_feature_dict(tags, seqs, alignment_dir, data_processor, args):
         feature_dict = data_processor.process_fasta(
             fasta_path=tmp_fasta_path,
             alignment_dir=local_alignment_dir,
-            seqemb_mode=args["use_single_seq_mode"],
+            seqemb_mode=True
         )
     else:
         with open(tmp_fasta_path, "w") as fp:
@@ -186,3 +224,25 @@ def make_hard_mask(mask_logits, threshold=0.15):
     hard_mask = hard_mask.view(mask_logits.shape)
 
     return hard_mask
+
+def get_dropout_rate(mask):
+    config_path = os.path.join('tmp_dropout_config.json')
+    with open(config_path, 'r') as config_file:
+        config = json.load(config_file)
+    dropout_rate = config.get('DROPOUT_RATE', 0)
+    sorted_values, indices = torch.sort(mask.view(-1), descending=False)
+    threshold = sorted_values[int(sorted_values.numel() * dropout_rate)]
+
+    hard_mask = (mask > threshold).float()
+    extremified_mask = mask + (hard_mask - mask).detach()
+
+    return 1 - torch.mean(extremified_mask)
+
+def setup_alignment_runner_soloseq(args, template_searcher):
+    alignment_runner = data_pipeline.AlignmentRunner(
+        jackhmmer_binary_path=args["jackhmmer_binary_path"],
+        uniref90_database_path=args["uniref90_database_path"],
+        template_searcher=template_searcher,
+        no_cpus=args["cpus"],
+    )
+    return alignment_runner

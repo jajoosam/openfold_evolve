@@ -13,10 +13,12 @@ from openfold.data.tools import hhsearch, hmmsearch
 from openfold.data import templates, feature_pipeline, data_pipeline
 from openfold.utils.script_utils import prep_output
 from openfold.np import protein
-from openfold.utils.import_weights import import_jax_weights_
+from openfold.utils.import_weights import import_jax_weights_, import_openfold_weights_
 from openfold.utils.tensor_utils import tensor_tree_map
+from scripts.precompute_embeddings import EmbeddingGenerator
 
-from targets import names, tags, seqs
+
+from targets_solo import names, tags, seqs
 
 import numpy as np
 import wandb
@@ -37,7 +39,7 @@ logging.basicConfig()
 logger = logging.getLogger(__file__)
 logger.setLevel(level=logging.INFO)
 
-config = model_config("model_1_multimer_v3", True, False)
+config = model_config("seq_model_esm1b_ptm", True, False)
 
 import argparse
 
@@ -58,7 +60,7 @@ parser_args = parser.parse_args()
 print(parser_args.binarized)
 
 args = {
-    "config_preset": "model_1_multimer_v2",
+    "config_preset": "seq_model_esm1b_ptm",
     "hmmsearch_binary_path": "/home/ubuntu/miniforge3/envs/openfold_env/bin/hmmsearch",
     "hhblits_binary_path": "/home/ubuntu/miniforge3/envs/openfold_env/bin/hhblits",
     "jackhmmer_binary_path": "/home/ubuntu/miniforge3/envs/openfold_env/bin/jackhmmer",
@@ -76,12 +78,13 @@ args = {
     "output_dir": "../output",
     "alignment_dir": "../alignment_dir",
     "cpus": 28,
-    "use_precomputed_alignments": False,
+    "use_precomputed_alignments": True,
     "model_device": "cuda:0",
+    "use_single_seq_mode": True,
 }
 
-args["jax_param_path"] = (
-    f"../openfold/resources/params/v2.2/params_{args['config_preset']}.npz"
+args["openfold_checkpoint_path"] = (
+    "../openfold/resources/openfold_soloseq_params/seq_model_esm1b_ptm.pt"
 )
 
 
@@ -93,20 +96,20 @@ def get_model_basename(model_path):
             )[0]
 
 
-model_basename = get_model_basename(args["jax_param_path"])
+model_basename = get_model_basename(args["openfold_checkpoint_path"])
 model_version = "_".join(model_basename.split("_")[1:])
 
 
 
-data_processor = setup_data_processor(None)
+data_processor = setup_data_processor(None, soloseq=True)
 feature_processor = feature_pipeline.FeaturePipeline(config["data"])
 
-name = "H1140"
+name = "7BNY"
 target_index = names.index(name)
 
 
 precompute_alignments(
-    tags[target_index], seqs[target_index], args["alignment_dir"], args
+    tags[target_index], seqs[target_index], args["alignment_dir"], args, soloseq=True
 )
 
 feature_dict = generate_feature_dict(
@@ -115,10 +118,11 @@ feature_dict = generate_feature_dict(
     args["alignment_dir"],
     data_processor,
     args,
+    soloseq=True
 )
 
 processed_feature_dict = feature_processor.process_features(
-    feature_dict, mode="predict", is_multimer=True
+    feature_dict, mode="predict", is_multimer=False
 )
 
 processed_feature_dict = {
@@ -166,7 +170,8 @@ config_run = {
     "sam": parser_args.sam,
     "friendly_sam": parser_args.friendly_sam,
     "rho": parser_args.rho,
-    "only_first_dropout": False
+    "only_first_dropout": False,
+    "soloseq": True
 }
 
 dropout_config = {
@@ -196,7 +201,10 @@ for s in seqs[target_index]:
 from openfold.model.model import AlphaFold
 
 model = AlphaFold(config)
-import_jax_weights_(model, args["jax_param_path"], version=model_version)
+d = torch.load(args["openfold_checkpoint_path"])
+if "ema" in d:
+    d = d["ema"]["params"]
+import_openfold_weights_(model=model, state_dict=d)
 model = model.to(args["model_device"])
 
 template_enabled = model.config["template"]["enabled"]
