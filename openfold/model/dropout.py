@@ -4,18 +4,25 @@ import json
 import os
 from functools import partialmethod
 from typing import Union, List, Optional
-
+import logging
+import numpy as np
 
 # Doing this in a jank way to prevent conflicts with OpenFold's checkpointing
-config_path = os.path.join('..', '..', 'optimize', 'tmp_dropout_config.json')
+config_path = "tmp_dropout_config.json"
 with open(config_path, 'r') as config_file:
     config = json.load(config_file)
 
 NOISE_FACTOR = config.get('NOISE_FACTOR', 0.1)  
 BINARIZE = config.get('BINARIZE', False)
-DROPOUT_RATE = config.get('DROPOUT_RATE', 0.5)
+DROPOUT_RATE = config.get('DROPOUT_RATE', 0.15)
+DISABLED = config.get('DISABLED', False)
 
 
+
+def noise(shape, noise_factor):
+    noise = np.random.randn(*shape) * noise_factor
+    noise_torch = torch.from_numpy(noise).float()
+    return noise_torch
 
 class Dropout(nn.Module):
     """
@@ -33,6 +40,15 @@ class Dropout(nn.Module):
             batch_dim:
                 Dimension(s) along which the dropout mask is shared
         """
+        config_path = "tmp_dropout_config.json"
+        with open(config_path, 'r') as config_file:
+            config = json.load(config_file)
+
+            self.noise_factor = config.get('NOISE_FACTOR', 0.1)  
+            self.binarize = config.get('BINARIZE', False)
+            self.dropout_rate = config.get('DROPOUT_RATE', 0.05)
+            self.disabled = config.get('DISABLED', False)
+
         super(Dropout, self).__init__()
 
         self.r = r
@@ -51,49 +67,38 @@ class Dropout(nn.Module):
                 Optional pre-determined dropout mask. If provided, it should be
                 of the same shape as `x` or broadcastable to `x`.
         """
-        # print(f"any_nan pre: {torch.any(torch.isnan(x))}")
+        if(self.disabled or mask is None):
+            return x
+        # else:
+        #     print(f"Got mask {mask.shape}")
         shape = list(x.shape)
+
         if self.batch_dim is not None:
             for bd in self.batch_dim:
                 shape[bd] = 1
-        if mask is None:
-            shape = list(x.shape)
-            if self.batch_dim is not None:
-                for bd in self.batch_dim:
-                    shape[bd] = 1
-            mask = x.new_ones(shape)
-            mask = self.dropout(mask)
+
+        correct_view_mask = mask.view(shape)
+        noised_mask = correct_view_mask + noise(correct_view_mask.shape, self.noise_factor).to(correct_view_mask.device)
+
+        if(self.binarize):
+            sorted_values, indices = torch.sort(noised_mask.view(-1), descending=False)
+            threshold = sorted_values[int(sorted_values.numel() * self.dropout_rate)]
+
+            hard_mask = (noised_mask > threshold).float()
+            extremified_mask = noised_mask + (hard_mask - noised_mask).detach()
+
         else:
-            correct_view_mask = mask.view(shape)
-
-            noise = torch.randn_like(correct_view_mask) * correct_view_mask.std() * NOISE_FACTOR
-            noised_mask = correct_view_mask + noise
-
-            sigmoided_mask = torch.sigmoid(noised_mask)
-
-            if(BINARIZE):
-                sorted_values, indices = torch.sort(sigmoided_mask.view(-1), descending=False)
-                threshold = sorted_values[int(sorted_values.numel() * DROPOUT_RATE)]
-
-                hard_mask = (sigmoided_mask > threshold).float()
-                extremified_mask = sigmoided_mask + (hard_mask - sigmoided_mask).detach()
-            else:
-                extremified_mask = sigmoided_mask
-
-
-            dropout_rate = 1 - torch.mean(extremified_mask)
-
-
-            dropped_x = x * extremified_mask
-            dropped_x *= 1 / (1 - dropout_rate)
-            x = dropped_x
-
-            return x
-
-        x *= mask
-
+            extremified_mask = noised_mask
         
-        return x
+
+
+        dropout_rate = 1 - torch.mean(extremified_mask)
+
+        dropped_x = x * extremified_mask
+
+        dropped_x *= 1 / (1 - dropout_rate)
+
+        return dropped_x
 
 
 class DropoutRowwise(Dropout):

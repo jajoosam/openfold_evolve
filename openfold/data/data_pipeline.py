@@ -836,8 +836,10 @@ class DataPipeline:
     def _process_seqemb_features(self,
         alignment_dir: str,
     ) -> Mapping[str, Any]:
+        print("processing soloseq features")
         seqemb_features = {}
         for f in os.listdir(alignment_dir):
+            print(f)
             path = os.path.join(alignment_dir, f)
             ext = os.path.splitext(f)[-1]
 
@@ -845,7 +847,7 @@ class DataPipeline:
                 # Load embedding file
                 seqemb_data = torch.load(path)
                 seqemb_features["seq_embedding"] = seqemb_data["representations"][33]
-
+        print(seqemb_features)
         return seqemb_features
 
     def process_fasta(

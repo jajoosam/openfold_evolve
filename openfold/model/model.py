@@ -573,7 +573,7 @@ class AlphaFold(nn.Module):
 
             # Enable grad iff we're training and it's the final recycling layer
             is_final_iter = cycle_no == (num_iters - 1) or early_stop
-            with torch.set_grad_enabled(is_grad_enabled and is_final_iter):
+            with torch.set_grad_enabled(is_final_iter):
             # with torch.set_grad_enabled(is_grad_enabled):
                 print(f"Grad: {is_grad_enabled}")
                 print(f"Final iter: {is_final_iter}")

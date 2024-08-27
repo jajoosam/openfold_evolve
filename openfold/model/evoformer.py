@@ -44,6 +44,14 @@ from openfold.utils.checkpointing import checkpoint_blocks, get_checkpoint_fn
 from openfold.utils.chunk_utils import chunk_layer, ChunkSizeTuner
 from openfold.utils.tensor_utils import add
 
+import json
+import os
+
+config_path = os.path.join('tmp_dropout_config.json')
+with open(config_path, 'r') as config_file:
+    config = json.load(config_file)
+
+ONLY_FIRST_DROPOUT = config.get('ONLY_FIRST_DROPOUT', False)
 
 class MSATransition(nn.Module):
     """
@@ -460,7 +468,6 @@ class EvoformerBlock(MSABlock):
                                      chunk_size=chunk_size,
                                      inplace_safe=inplace_safe,
                                      _offload_inference=_offload_inference)
-
         m = add(m,
                 self.msa_dropout_layer(
                     self.msa_att_row(
@@ -882,7 +889,7 @@ class EvoformerStack(nn.Module):
     ):
         blocks = [
             partial(
-                b,
+                self.blocks[n],
                 msa_mask=msa_mask,
                 pair_mask=pair_mask,
                 chunk_size=chunk_size,
@@ -891,10 +898,10 @@ class EvoformerStack(nn.Module):
                 use_flash=use_flash,
                 inplace_safe=inplace_safe,
                 _mask_trans=_mask_trans,
-                msa_dropout_mask=msa_dropout_mask,
-                pair_dropout_mask=pair_dropout_mask,
+                msa_dropout_mask=None if (ONLY_FIRST_DROPOUT and n != 0) else msa_dropout_mask,
+                pair_dropout_mask=None if (ONLY_FIRST_DROPOUT and n != 0) else pair_dropout_mask,
             )
-            for b in self.blocks
+            for n in range(len(self.blocks))
         ]
 
         if(self.clear_cache_between_blocks):

@@ -164,6 +164,7 @@ def model_config(
         c.model.heads.tm.enabled = True
         c.loss.tm.weight = 0.1
     elif name.startswith("seq"):  # SINGLE SEQUENCE EMBEDDING PRESETS
+        print("seqemb!!")
         c.update(seq_mode_config.copy_and_resolve_references())
         if name == "seqemb_initial_training":
             c.data.train.max_msa_clusters = 1
